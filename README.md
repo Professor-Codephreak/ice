@@ -44,7 +44,7 @@ boot-persistence unit **if you explicitly enabled it**.
 ## Run
 From a terminal (so the sudo prompt is visible):
 ```bash
-./run.sh          # or:  ./ice.py
+./ice.sh          # or:  ./ice.py
 ```
 It prints “Requesting sudo…”, prompts for your password, then opens the window and
 puts an icon (showing live temperature) in the tray.
