@@ -22,6 +22,7 @@ CLI:
 import os
 import sys
 import glob
+import math
 import shutil
 import signal
 import subprocess
@@ -212,6 +213,52 @@ def airgap(on):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# ── Fan: read RPM always; allow targeting ONLY when the hardware exposes PWM ────
+def _find_fan_input():
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        fans = sorted(glob.glob(os.path.join(h, "fan*_input")))
+        if fans:
+            return fans[0]
+    return None
+
+
+def _find_fan_pwm():
+    # A pwmN with a pwmN_enable sibling = proper, standard manual control.
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        for p in sorted(glob.glob(os.path.join(h, "pwm[0-9]"))):
+            if os.path.exists(p + "_enable"):
+                return p
+    return None
+
+
+FAN_INPUT = _find_fan_input()
+FAN_PWM = _find_fan_pwm()
+
+
+def fan_rpm():
+    if not FAN_INPUT:
+        return None
+    return read_int(FAN_INPUT, 0) or None
+
+
+def fan_can_control():
+    return FAN_PWM is not None
+
+
+def set_fan_pct(pct):
+    """Target fan speed 0–100 % (manual). Only when fan_can_control()."""
+    if not FAN_PWM:
+        return
+    _write(FAN_PWM + "_enable", 1)                       # 1 = manual
+    _write(FAN_PWM, int(max(0, min(100, pct)) / 100 * 255))
+
+
+def fan_auto():
+    """Hand the fan back to the firmware/driver (automatic)."""
+    if FAN_PWM:
+        _write(FAN_PWM + "_enable", 2)
+
+
 # ── Boot persistence (config + systemd unit) ──────────────────────────────────
 CONFIG = "/etc/ice-cpu.conf"
 SERVICE_NAME = "ice.service"
@@ -322,7 +369,7 @@ def uninstall(remove_dir=True):
 # ── GTK GUI + tray ────────────────────────────────────────────────────────────
 import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib  # noqa: E402
+from gi.repository import Gtk, GLib, Gdk  # noqa: E402
 
 APPIND = None
 for _name in ("AyatanaAppIndicator3", "AppIndicator3"):
@@ -334,11 +381,92 @@ for _name in ("AyatanaAppIndicator3", "AppIndicator3"):
         continue
 
 
+class ThermostatDial(Gtk.DrawingArea):
+    """Classic round thermostat dial (cairo). Shows the current CPU temperature on
+    a coloured arc and a draggable target marker. lo..hi °C over a 270° sweep.
+    Click/drag to set the target; calls on_change(target)."""
+    _START, _SPAN = 135.0, 270.0
+
+    def __init__(self, lo=50, hi=95, on_change=None):
+        super().__init__()
+        self.lo, self.hi, self.on_change = lo, hi, on_change
+        self.target = 80.0
+        self.current = None
+        self.set_size_request(180, 180)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON1_MOTION_MASK)
+        self.connect("draw", self._on_draw)
+        self.connect("button-press-event", self._on_pointer)
+        self.connect("motion-notify-event", self._on_pointer)
+
+    def set_current(self, t):
+        self.current = t
+        self.queue_draw()
+
+    def set_target(self, t):
+        self.target = max(self.lo, min(self.hi, float(t)))
+        self.queue_draw()
+
+    def _val2ang(self, v):
+        frac = (v - self.lo) / (self.hi - self.lo)
+        return math.radians(self._START + frac * self._SPAN)
+
+    def _ang2val(self, ang_deg):
+        a = (ang_deg - self._START) % 360         # 0 at start, clockwise
+        if a > self._SPAN:                         # inside the bottom gap → snap to nearest end
+            a = 0 if a > (self._SPAN + 360) / 2 else self._SPAN
+        return self.lo + a / self._SPAN * (self.hi - self.lo)
+
+    @staticmethod
+    def _color(t):
+        if t is None:
+            return (0.5, 0.6, 0.7)
+        if t >= 85:
+            return (0.96, 0.32, 0.29)
+        if t >= 70:
+            return (1.0, 0.6, 0.0)
+        return (0.30, 0.69, 0.31)
+
+    def _on_draw(self, _w, cr):
+        a, b = self.get_allocated_width(), self.get_allocated_height()
+        cx, cy, R = a / 2, b / 2, min(a, b) / 2 - 14
+        s, e = math.radians(self._START), math.radians(self._START + self._SPAN)
+        cr.set_line_cap(1)  # round
+        cr.set_line_width(12); cr.set_source_rgb(0.15, 0.16, 0.18)
+        cr.arc(cx, cy, R, s, e); cr.stroke()
+        if self.current is not None:
+            cr.set_source_rgb(*self._color(self.current))
+            cr.arc(cx, cy, R, s, self._val2ang(max(self.lo, min(self.hi, self.current)))); cr.stroke()
+        ta = self._val2ang(self.target)             # target marker (electric blue)
+        cr.set_line_width(3); cr.set_source_rgb(0.0, 0.75, 1.0)
+        cr.move_to(cx + (R - 12) * math.cos(ta), cy + (R - 12) * math.sin(ta))
+        cr.line_to(cx + (R + 9) * math.cos(ta), cy + (R + 9) * math.sin(ta)); cr.stroke()
+        cr.set_source_rgb(0.90, 0.90, 0.92)         # centre text
+        cr.select_font_face("Sans", 0, 1); cr.set_font_size(28)
+        txt = f"{self.target:.0f}°"
+        ext = cr.text_extents(txt); cr.move_to(cx - ext.width / 2, cy + ext.height / 2 - 4); cr.show_text(txt)
+        cr.set_font_size(11); cr.set_source_rgb(0.6, 0.6, 0.62)
+        sub = "target" if self.current is None else f"now {self.current:.0f}°C"
+        ext2 = cr.text_extents(sub); cr.move_to(cx - ext2.width / 2, cy + 24); cr.show_text(sub)
+
+    def _on_pointer(self, _w, ev):
+        pressed = ev.type == Gdk.EventType.BUTTON_PRESS
+        dragging = bool(ev.state & Gdk.ModifierType.BUTTON1_MASK)
+        if not (pressed or dragging):
+            return False
+        a, b = self.get_allocated_width(), self.get_allocated_height()
+        ang = math.degrees(math.atan2(ev.y - b / 2, ev.x - a / 2))
+        self.set_target(self._ang2val(ang))
+        if self.on_change:
+            self.on_change(round(self.target))
+        return True
+
+
 class Controller:
     def __init__(self):
         self.auto = False
         self.target = 80
         self._applying = False
+        self._syncing = False
         self._build_window()
         self._build_tray()
         self.tick()
@@ -361,8 +489,9 @@ class Controller:
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.cpu_lbl = Gtk.Label(label="CPU: --%", xalign=0)
         self.freq_lbl = Gtk.Label(label="Freq: -- GHz", xalign=0)
+        self.fan_lbl = Gtk.Label(label="Fan: --", xalign=0)
         self.drv_lbl = Gtk.Label(label=("intel_pstate" if HAS_PSTATE else "cpufreq") + " driver", xalign=0)
-        for w in (self.cpu_lbl, self.freq_lbl, self.drv_lbl):
+        for w in (self.cpu_lbl, self.freq_lbl, self.fan_lbl, self.drv_lbl):
             info.pack_start(w, False, False, 0)
         row.pack_start(info, False, False, 0)
         box.pack_start(row, False, False, 0)
@@ -401,17 +530,56 @@ class Controller:
             pf.pack_start(b, False, False, 0)
         box.pack_start(pf, False, False, 0)
 
-        # auto-cool
-        af = Gtk.Box(spacing=6)
-        self.auto_chk = Gtk.CheckButton(label="Auto-cool: keep under")
+        # ── Thermostat: one target temperature, three synced controls ──
+        box.pack_start(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL), False, False, 4)
+        thead = Gtk.Label(); thead.set_markup("<b>🌡 Thermostat</b> — one target temperature, three ways to set it")
+        thead.set_xalign(0); box.pack_start(thead, False, False, 0)
+        self.auto_chk = Gtk.CheckButton(label="Auto-cool ON — hold the CPU at/under the target")
         self.auto_chk.connect("toggled", self._on_auto)
-        af.pack_start(self.auto_chk, False, False, 0)
-        adj = Gtk.Adjustment(value=self.target, lower=50, upper=95, step_increment=1)
-        self.target_spin = Gtk.SpinButton(adjustment=adj)
-        self.target_spin.connect("value-changed", self._on_target)
-        af.pack_start(self.target_spin, False, False, 0)
-        af.pack_start(Gtk.Label(label="°C"), False, False, 0)
-        box.pack_start(af, False, False, 0)
+        box.pack_start(self.auto_chk, False, False, 0)
+
+        trow = Gtk.Box(spacing=14)
+        self.dial = ThermostatDial(50, 95, on_change=self._set_target)   # 1) classic dial
+        trow.pack_start(self.dial, False, False, 0)
+
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        col.set_valign(Gtk.Align.CENTER)
+        # 2) slider bar
+        sl = Gtk.Box(spacing=6)
+        sl.pack_start(Gtk.Label(label="Slider"), False, False, 0)
+        self.target_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 50, 95, 1)
+        self.target_scale.set_value(self.target); self.target_scale.set_size_request(210, -1)
+        self.target_scale.connect("value-changed", lambda s: self._set_target(int(s.get_value())))
+        sl.pack_start(self.target_scale, True, True, 0)
+        col.pack_start(sl, False, False, 0)
+        # 3) up / down
+        ud = Gtk.Box(spacing=6)
+        ud.pack_start(Gtk.Label(label="Up / Down"), False, False, 0)
+        adj = Gtk.Adjustment(value=self.target, lower=50, upper=95, step_increment=1, page_increment=5)
+        self.target_spin = Gtk.SpinButton(); self.target_spin.set_adjustment(adj); self.target_spin.set_digits(0)
+        self.target_spin.connect("value-changed", lambda s: self._set_target(int(s.get_value())))
+        ud.pack_start(self.target_spin, False, False, 0)
+        down = Gtk.Button(label="▼"); down.connect("clicked", lambda _b: self._set_target(self.target - 1))
+        up = Gtk.Button(label="▲"); up.connect("clicked", lambda _b: self._set_target(self.target + 1))
+        ud.pack_start(down, False, False, 0); ud.pack_start(up, False, False, 0)
+        ud.pack_start(Gtk.Label(label="°C"), False, False, 0)
+        col.pack_start(ud, False, False, 0)
+        trow.pack_start(col, True, True, 0)
+        box.pack_start(trow, False, False, 0)
+        self.dial.set_target(self.target)
+
+        # ── Fan speed: control only when the hardware exposes PWM (targetable) ──
+        if fan_can_control():
+            fanrow = Gtk.Box(spacing=6)
+            fanrow.pack_start(Gtk.Label(label="Fan target"), False, False, 0)
+            self.fan_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+            self.fan_scale.set_size_request(200, -1)
+            self.fan_scale.connect("value-changed", lambda s: set_fan_pct(int(s.get_value())))
+            fanrow.pack_start(self.fan_scale, True, True, 0)
+            fauto = Gtk.Button(label="Auto")
+            fauto.connect("clicked", lambda _b: (fan_auto(), self.status.set_text("Fan → automatic")))
+            fanrow.pack_start(fauto, False, False, 0)
+            box.pack_start(fanrow, False, False, 0)
 
         # persistence + uninstall
         persist = Gtk.Box(spacing=6)
@@ -509,8 +677,19 @@ class Controller:
     def _on_auto(self, c):
         self.auto = c.get_active()
 
-    def _on_target(self, s):
-        self.target = int(s.get_value())
+    def _set_target(self, value, *_):
+        """Single source of truth for the thermostat — keeps dial, slider and
+        up/down in sync. All three controls call this; the guard stops feedback."""
+        value = int(max(50, min(95, round(value))))
+        if self._syncing:
+            return
+        self._syncing = True
+        self.target = value
+        self.target_scale.set_value(value)
+        self.target_spin.set_value(value)
+        self.dial.set_target(value)
+        self._syncing = False
+        self.status.set_text(f"Thermostat target: {value}°C" + (" · auto-cool active" if self.auto else ""))
 
     def _on_radio(self, chk, kind):
         radio_set(kind, chk.get_active())
@@ -617,9 +796,13 @@ class Controller:
                 self.ind.set_label(f" {t:.0f}°C", "")
         else:
             self.temp_lbl.set_markup("<span size='xx-large' weight='bold'>n/a</span>")
+        if hasattr(self, "dial"):
+            self.dial.set_current(t)
         if psutil:
             self.cpu_lbl.set_text(f"CPU: {psutil.cpu_percent():.0f}%")
         self.freq_lbl.set_text(f"Freq: {cur_freq_ghz():.2f} GHz")
+        r = fan_rpm()
+        self.fan_lbl.set_text(f"Fan: {r:,} RPM" + ("" if fan_can_control() else " (read-only)") if r else "Fan: —")
 
         if self.auto and t is not None:
             cur = int(self.scale.get_value())
