@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# ICE maintains the github.com/cypherpunk2048 standard (client-controlled, local-first).
 """
 ICE — CPU / Temperature Controller  (localhost, single-use, GTK3 + tray)
 
