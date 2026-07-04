@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ICE — CPU / Temperature Controller
+Comment=Scale CPU performance and hold temperature down (asks for sudo)
+Exec=/home/luvai/ICE/ice.py
+Icon=utilities-system-monitor
+Terminal=true
+Categories=System;Settings;HardwareSettings;
+Keywords=cpu;temperature;thermal;throttle;scaling;governor;
