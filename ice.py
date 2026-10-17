@@ -936,6 +936,27 @@ class Controller:
             rf.set_sensitive(False)
             rr.set_sensitive(False)
 
+        # ── netkeep — modular extension (ice_netkeep.py, Qt-free, shared with BANKON's Qt ICE tab):
+        #    persistent LAN link (watchdog · backoff ladder · verify) + Wi-Fi HARD GATE (driver off)
+        try:
+            import ice_netkeep as _NK
+        except Exception:
+            _NK = None
+        if _NK:
+            self._nk = _NK
+            nk = Gtk.Label(); nk.set_xalign(0)
+            nk.set_markup("<b>🔗 netkeep</b> — persistent LAN link · <b>🚧 Wi-Fi hard gate</b> (driver unloaded)")
+            box.pack_start(nk, False, False, 0)
+            self.nk_lbl = Gtk.Label(label="link — …", xalign=0); self.nk_lbl.set_line_wrap(True)
+            box.pack_start(self.nk_lbl, False, False, 0)
+            nr = Gtk.Box(spacing=6)
+            for label, fn in (("↻ reconnect", self._nk_reconnect), ("⚡ power-save OFF", self._nk_powersave),
+                              ("✔ verify", self._nk_verify), ("🚧 HARD GATE down", self._nk_gate),
+                              ("🔌 HARD GATE up", self._nk_ungate)):
+                b = Gtk.Button(label=label); b.connect("clicked", fn); nr.pack_start(b, False, False, 0)
+            box.pack_start(nr, False, False, 0)
+            GLib.timeout_add(2500, lambda: (self._nk_refresh(), False)[1])
+
         # ── Firewall (ufw) — the software wall; ICE controls it ──
         fwrow = Gtk.Box(spacing=6)
         self.fw_lbl = Gtk.Label(xalign=0); self.fw_lbl.set_markup("🛡 firewall: …")
@@ -1402,6 +1423,32 @@ class Controller:
         radio_set(kind, chk.get_active())
         self.status.set_text(f"{kind}: {'on' if chk.get_active() else 'OFF — walled off'}")
 
+    # ── netkeep (ice_netkeep.py) — probes run off-thread; ICE is root so no pkexec prompts ──
+    def _nk_refresh(self):
+        import threading
+        def work():
+            st = self._nk.link_state()
+            if st.get("present"):
+                txt = (f"{st['iface']} ({st.get('driver') or '?'}) · {st['state']} · SSID {st.get('ssid') or '—'} "
+                       f"{st.get('signal') or 0}% · {st.get('ip') or 'no ip'} → gw {st.get('gw') or '—'} "
+                       f"{'✓' if st.get('gw_ok') else '✗'} · power-save {st.get('powersave') or '?'}")
+            else:
+                txt = "link — " + st.get("state", "no wifi device")
+            GLib.idle_add(self.nk_lbl.set_text, txt)
+        threading.Thread(target=work, daemon=True).start()
+    def _nk_reconnect(self, _b=None):
+        st = self._nk.link_state(); self.status.set_text("↻ " + self._nk.reconnect(st.get("conn"), st.get("iface")))
+        GLib.timeout_add(3000, lambda: (self._nk_refresh(), False)[1])
+    def _nk_powersave(self, _b=None):
+        st = self._nk.link_state()
+        self.status.set_text("⚡ " + self._nk.set_powersave(st.get("iface"), off=True, persist=True, conn=st.get("conn")))
+        GLib.timeout_add(3000, lambda: (self._nk_refresh(), False)[1])
+    def _nk_verify(self, _b=None):
+        self.status.set_text("verify — " + " · ".join(f"{k} {'✓' if v else '✗' if v is False else 'n/a'}" for k, v, _d in self._nk.verify()))
+    def _nk_gate(self, _b=None):
+        ok, msg = self._nk.hardgate_down(); self.status.set_text(("✓ " if ok else "✗ ") + msg); self._refresh_radios(); self._nk_refresh()
+    def _nk_ungate(self, _b=None):
+        ok, msg = self._nk.hardgate_up(); self.status.set_text(("✓ " if ok else "✗ ") + msg); self._refresh_radios(); self._nk_refresh()
     def _refresh_radios(self):
         for kind, c in getattr(self, "radio_chks", {}).items():
             try:
@@ -1513,6 +1560,8 @@ class Controller:
         self.fan_lbl.set_text(f"Fan: {r:,} RPM" + ("" if fan_can_control() else " (read-only)") if r else "Fan: —")
         # firewall + datadir are cheap but not per-1.5s — refresh every ~12 s
         self._slow = getattr(self, "_slow", 0) + 1
+        if hasattr(self, "_nk") and self._slow % 8 == 0:
+            self._nk_refresh()
         if self._slow % 8 == 0 and hasattr(self, "fw_lbl"):
             self._refresh_fw(); self._refresh_datadir()
         if getattr(self, "_bi", None):           # blackICE perimeter watch (every tick while armed)
