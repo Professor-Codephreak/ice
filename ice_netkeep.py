@@ -153,7 +153,7 @@ def ping_stats(host, count=3, wait=3, interval=0.3):
         out["loss_pct"] = round(100 * (1 - out["recv"] / max(1, out["sent"])))
     m = re.search(r"= [\d.]+/([\d.]+)/([\d.]+)/", r.stdout)
     if m:
-        out["avg_ms"], out["max_ms"] = round(float(m.group(1))), round(float(m.group(2)))
+        out["avg_ms"], out["max_ms"] = round(float(m.group(1)), 3), round(float(m.group(2)), 3)   # ping's own 3-dp resolution
     return out
 
 
@@ -412,11 +412,67 @@ def reset_driver(iface, conn=None):
 LADDER = ("profile", "device", "radio", "driver")   # escalation, one rung per failed attempt
 
 
+# ───────────────────────── MEASURE: time · volume · speed (the kernel's own counters) ─────────────────────────
+def iface_counters(iface):
+    """Exact byte/packet/error/drop counters from /sys/class/net/<iface>/statistics (since the
+    driver loaded). Integers, never floats — the truth every rate is derived from."""
+    if not iface:
+        return None
+    base = f"/sys/class/net/{iface}/statistics/"
+    out = {}
+    for k in ("rx_bytes", "tx_bytes", "rx_packets", "tx_packets", "rx_errors", "tx_errors", "rx_dropped", "tx_dropped"):
+        try:
+            out[k] = int(open(base + k).read().strip())
+        except (OSError, ValueError):
+            return None
+    out["ts"] = time.time()
+    return out
+
+
+def link_rate(iface):
+    """{signal_dbm, rx_mbps, tx_mbps} from `iw dev <iface> link` (unprivileged) — the PHY rate the
+    link negotiated, as opposed to the throughput it is actually carrying."""
+    out = {"signal_dbm": None, "rx_mbps": None, "tx_mbps": None}
+    if not iface or not _has("iw"):
+        return out
+    r = _run(["iw", "dev", iface, "link"], timeout=4)
+    for ln in (r.stdout.splitlines() if r else []):
+        m = re.search(r"signal:\s*(-?\d+)\s*dBm", ln)
+        if m: out["signal_dbm"] = int(m.group(1))
+        m = re.search(r"(rx|tx) bitrate:\s*([\d.]+)\s*MBit/s", ln)
+        if m: out[m.group(1) + "_mbps"] = float(m.group(2))
+    if out["signal_dbm"] is None:
+        try:
+            for ln in open("/proc/net/wireless"):
+                if ln.strip().startswith(iface + ":"):
+                    out["signal_dbm"] = int(float(ln.split()[3].rstrip(".")))
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+def conn_since(conn):
+    """Unix time NetworkManager last ACTIVATED this profile (connection.timestamp) — the honest
+    'connected since' for the current session, independent of when the watchdog started."""
+    if not _nm() or not conn:
+        return None
+    r = _run(["nmcli", "-g", "connection.timestamp", "connection", "show", conn], timeout=4)
+    try:
+        return int(r.stdout.strip()) or None
+    except (AttributeError, ValueError):
+        return None
+
+
 class Watchdog:
     """State machine — call tick() every few seconds; returns evidence events
-    ({'event': drop|retry|restored|verified|paused|resumed, …}). Pauses under the wall.
+    ({'event': drop|retry|restored|verified|paused|resumed|sample, …}). Pauses under the wall.
     Retry is systematic: exponential backoff (base 5 s, ×2, cap 60 s, ±20 % jitter) and an
-    escalation ladder profile → device → radio → driver (driver only if allow_driver)."""
+    escalation ladder profile → device → radio → driver (driver only if allow_driver).
+    MEASURES while up: session time (from NetworkManager's activation timestamp), volume
+    (iface byte counters since the session started / since the driver loaded), throughput
+    (B/s from counter deltas, with peaks) and the negotiated PHY rate + signal; one `sample`
+    event a minute carries them into the .history."""
+    SAMPLE_EVERY = 60.0
     def __init__(self, auto=True, grace=2, base=5.0, cap=60.0, allow_driver=False, grace_held=6):
         self.auto = auto; self.grace = grace; self.base = base; self.cap = cap; self.allow_driver = allow_driver
         self.grace_held = grace_held          # probes to tolerate while NetworkManager still says 'connected'
@@ -425,6 +481,41 @@ class Watchdog:
         self.drops = 0; self.reconnects = 0; self.last_drop = None; self.up_since = None
         self.paused = False; self.last_action = ""; self.attempt = 0; self.next_at = 0.0
         self.verified = None                  # last verify() result after a restore
+        self.sess = None; self._cnt_prev = None; self._sample_ts = 0.0
+    # ---- measurement ----
+    def _measure(self, st, now):
+        iface = st.get("iface"); c = iface_counters(iface); rate = link_rate(iface) if iface else {}
+        st["counters"] = c; st["rate"] = rate
+        if not c:
+            return
+        if self.sess is None:
+            since = conn_since(st.get("conn")) or now
+            self.sess = {"since": since, "rx0": c["rx_bytes"], "tx0": c["tx_bytes"], "rx_bps": 0, "tx_bps": 0,
+                         "peak_rx_bps": 0, "peak_tx_bps": 0, "samples": 0}
+        s = self.sess
+        if self._cnt_prev and c["ts"] > self._cnt_prev["ts"] and c["rx_bytes"] >= self._cnt_prev["rx_bytes"]:
+            dt = c["ts"] - self._cnt_prev["ts"]
+            s["rx_bps"] = int((c["rx_bytes"] - self._cnt_prev["rx_bytes"]) / dt)
+            s["tx_bps"] = int((c["tx_bytes"] - self._cnt_prev["tx_bytes"]) / dt)
+            s["peak_rx_bps"] = max(s["peak_rx_bps"], s["rx_bps"]); s["peak_tx_bps"] = max(s["peak_tx_bps"], s["tx_bps"])
+        self._cnt_prev = c
+        s["rx_B"] = c["rx_bytes"] - s["rx0"]; s["tx_B"] = c["tx_bytes"] - s["tx0"]
+        s["uptime_s"] = int(now - s["since"])
+        s["rx_mbps"] = rate.get("rx_mbps"); s["tx_mbps"] = rate.get("tx_mbps"); s["signal_dbm"] = rate.get("signal_dbm")
+        s["errors"] = c["rx_errors"] + c["tx_errors"]; s["dropped"] = c["rx_dropped"] + c["tx_dropped"]
+    def session(self):
+        """The measured session, or None before the first up tick. Keys: since, uptime_s, rx_B, tx_B
+        (session volume), rx_bps, tx_bps (live), peak_*_bps, rx_mbps/tx_mbps (PHY), signal_dbm,
+        errors, dropped, samples."""
+        return dict(self.sess) if self.sess else None
+    def _sample_event(self, st):
+        s = self.sess; pg = st.get("ping") or {}; c = st.get("counters") or {}
+        s["samples"] += 1
+        return {"event": "sample", "uptime_s": s["uptime_s"], "rx_B": s["rx_B"], "tx_B": s["tx_B"],
+                "rx_Bps": s["rx_bps"], "tx_Bps": s["tx_bps"], "rx_mbps": s["rx_mbps"], "tx_mbps": s["tx_mbps"],
+                "signal_dbm": s["signal_dbm"], "signal_pct": st.get("signal"), "loss_pct": pg.get("loss_pct"),
+                "avg_ms": pg.get("avg_ms"), "errors": s["errors"], "dropped": s["dropped"],
+                "iface_rx_total_B": c.get("rx_bytes"), "iface_tx_total_B": c.get("tx_bytes")}
     def _delay(self):
         import random
         d = min(self.cap, self.base * (2 ** self.attempt))
@@ -452,6 +543,9 @@ class Watchdog:
             self.fails = 0; self.attempt = 0; return ev
         up = st["present"] and st["gw_ok"] is True
         if up:
+            if self.was_up is not True:
+                self.up_since = now; self.sess = None; self._cnt_prev = None   # a new session starts here
+            self._measure(st, now)
             if st.get("degraded") != self.degraded:          # quality edge: evidence, never an action
                 self.degraded = bool(st.get("degraded")); pg = st.get("ping") or {}
                 ev.append({"event": "degraded" if self.degraded else "quality-ok", "loss_pct": pg.get("loss_pct"),
@@ -462,16 +556,20 @@ class Watchdog:
                 self.verified = verify()
                 ev.append({"event": "verified", "checks": {k: v for k, v, _d in self.verified},
                            "detail": "; ".join(f"{k}: {'✓' if v else '✗' if v is False else 'n/a'} {d}" for k, v, d in self.verified)})
-            if self.was_up is not True:
-                self.up_since = now
+            if self.sess and now - self._sample_ts >= self.SAMPLE_EVERY:
+                self._sample_ts = now; ev.append(self._sample_event(st))
             self.fails = 0; self.attempt = 0; self.was_up = True; return ev
         self.fails += 1
         held = bool(st.get("nm_state", "") or "").startswith("connected") and bool(st.get("ip"))
         need = self.grace_held if held else self.grace      # NM still holds the link → wait longer, don't re-dial a live link
         if self.was_up is not False and self.fails >= need:
             self.was_up = False; self.drops += 1; self.last_drop = now; self.attempt = 0; self.next_at = now
+            s = self.sess or {}
             ev.append({"event": "drop", "iface": st["iface"], "ssid": st["ssid"], "nm": st["nm_state"],
-                       "gw": st["gw"], "powersave": st["powersave"]})
+                       "gw": st["gw"], "powersave": st["powersave"],
+                       "session_s": s.get("uptime_s"), "session_rx_B": s.get("rx_B"), "session_tx_B": s.get("tx_B"),
+                       "peak_rx_Bps": s.get("peak_rx_bps"), "peak_tx_Bps": s.get("peak_tx_bps")})
+            self.sess = None; self._cnt_prev = None
         if self.was_up is False and self.auto and now >= self.next_at and self.fails >= need:
             rung, act = self._act(st); self.last_action = f"[{self.attempt + 1}·{rung}] {act}"; self.reconnects += 1
             ev.append({"event": "retry", "rung": rung, "action": act, "attempt": self.attempt + 1})
