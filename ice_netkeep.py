@@ -768,3 +768,89 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ───────────────────────── CONNECT: new Wi-Fi connections + profile hygiene (NetworkManager) ─────────────────────────
+def wifi_connect(ssid, psk=None, iface=None, hidden=False):
+    """Join a network (creates/updates the profile). Unprivileged for the active user via polkit.
+    Returns (ok, message). Never logs the passphrase."""
+    if not _nm():
+        return False, "NetworkManager (nmcli) not available"
+    cmd = ["nmcli", "device", "wifi", "connect", ssid] + (["password", psk] if psk else []) + (["ifname", iface] if iface else []) + (["hidden", "yes"] if hidden else [])
+    r = _run(cmd, timeout=45)
+    ok = bool(r and r.returncode == 0)
+    return ok, (r.stdout.strip() or r.stderr.strip() if r else "nmcli timed out")[:240]
+
+
+def profile_set(name, autoconnect=None, priority=None, retries=None, powersave=None, bssid=None):
+    """Tune a saved profile: autoconnect yes/no · autoconnect-priority · autoconnect-retries (0 = forever)
+    · 802-11-wireless.powersave (2 = off) · pin to a BSSID (evil-twin defence)."""
+    if not _nm():
+        return False, "no NetworkManager"
+    args = []
+    if autoconnect is not None: args += ["connection.autoconnect", "yes" if autoconnect else "no"]
+    if priority is not None: args += ["connection.autoconnect-priority", str(int(priority))]
+    if retries is not None: args += ["connection.autoconnect-retries", str(int(retries))]
+    if powersave is not None: args += ["802-11-wireless.powersave", str(int(powersave))]
+    if bssid is not None: args += ["802-11-wireless.bssid", bssid or ""]
+    if not args:
+        return False, "nothing to change"
+    r = _run(["nmcli", "connection", "modify", name] + args, timeout=15)
+    ok = bool(r and r.returncode == 0)
+    return ok, (r.stderr.strip() if r and r.stderr else f"'{name}' updated")[:200]
+
+
+def profile_delete(name):
+    r = _run(["nmcli", "connection", "delete", name], timeout=15)
+    return bool(r and r.returncode == 0), (r.stdout.strip() or r.stderr.strip() if r else "nmcli timed out")[:200]
+
+
+def profile_up(name):
+    r = _run(["nmcli", "connection", "up", name], timeout=45)
+    return bool(r and r.returncode == 0), (r.stdout.strip() or r.stderr.strip() if r else "nmcli timed out")[:200]
+
+
+def profile_down(name):
+    r = _run(["nmcli", "connection", "down", name], timeout=20)
+    return bool(r and r.returncode == 0), (r.stdout.strip() or r.stderr.strip() if r else "nmcli timed out")[:200]
+
+
+def profile_detail(name):
+    """The fields that matter for a persistent link, as NetworkManager stores them."""
+    q = _run(["nmcli", "-t", "-f", "connection.autoconnect,connection.autoconnect-priority,connection.autoconnect-retries,"
+              "802-11-wireless.powersave,802-11-wireless.bssid,802-11-wireless.ssid,802-11-wireless-security.key-mgmt,"
+              "connection.timestamp,ipv4.method,ipv6.method", "connection", "show", name], timeout=8)
+    out = {}
+    for ln in (q.stdout.splitlines() if q else []):
+        k, _, v = ln.partition(":"); out[k.split(".")[-1]] = v
+    return out
+
+
+def diagnostics(iface=None, seed="seed.bitcoin.sipa.be"):
+    """Connection diagnostics as plain rows [(check, ok|None, detail)] — gateway · DNS · internet ·
+    MTU · route · resolver · link quality · drops — all from the minimal tools (ping, ip, getent, iw)."""
+    rows = []
+    st = link_state(); iface = iface or st.get("iface")
+    rows.append(("link", bool(st.get("present")), f"{iface or '—'} · {st.get('state')} · SSID {st.get('ssid') or '—'} {st.get('signal') or '—'}% · {st.get('ip') or 'no ip'}"))
+    gw = st.get("gw"); pg = st.get("ping") or {}
+    rows.append(("gateway", st.get("gw_ok"), f"{gw or 'no default route'} · loss {pg.get('loss_pct', '—')}% · avg {pg.get('avg_ms', '—')} ms"))
+    r = _run(["ip", "route", "get", "9.9.9.9"], timeout=4)
+    rows.append(("route", bool(r and "via" in r.stdout), (r.stdout.strip().split("\n")[0][:120] if r and r.stdout else "no route")))
+    pi = ping_stats("9.9.9.9", count=3, wait=3)
+    rows.append(("internet", pi["recv"] > 0, f"9.9.9.9 · loss {pi['loss_pct']}% · avg {pi['avg_ms'] or '—'} ms"))
+    r = _run(["getent", "hosts", seed], timeout=6)
+    rows.append(("dns", bool(r and r.returncode == 0 and r.stdout.strip()), f"{seed} → {len(r.stdout.splitlines()) if r and r.stdout else 0} answers"))
+    try:
+        mtu = int(open(f"/sys/class/net/{iface}/mtu").read().strip()) if iface else None
+    except (OSError, ValueError):
+        mtu = None
+    big = _run(["ping", "-c", "1", "-W", "2", "-M", "do", "-s", "1472", "9.9.9.9"], timeout=5) if iface else None
+    rows.append(("mtu", (big.returncode == 0) if big else None, f"iface mtu {mtu or '—'} · 1500-byte DF probe {'passes' if big and big.returncode == 0 else 'fragments/blocked'}"))
+    rate = link_rate(iface) if iface else {}
+    rows.append(("phy", rate.get("rx_mbps") is not None, f"rx {rate.get('rx_mbps') or '—'} / tx {rate.get('tx_mbps') or '—'} Mbit/s · {rate.get('signal_dbm') if rate.get('signal_dbm') is not None else '—'} dBm"))
+    c = iface_counters(iface) if iface else None
+    rows.append(("errors", (c["rx_errors"] + c["tx_errors"] + c["rx_dropped"] + c["tx_dropped"]) == 0 if c else None,
+                 f"rx err {c['rx_errors']} drop {c['rx_dropped']} · tx err {c['tx_errors']} drop {c['tx_dropped']}" if c else "no counters"))
+    d = recent_drops(24)
+    rows.append(("drops 24h", len(d) == 0, f"{len(d)} disconnects" + (f" · last: {d[-1][3]}" if d else "")))
+    return rows
