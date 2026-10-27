@@ -208,8 +208,9 @@ def probe():
     paths.append({"key": "pcp", "name": "PCP / NAT-PMP (Core -natpmp)", "state": {"mapped": "working", "timeout": "unsupported", "bind-error": "error"}.get(pcp, "unknown"),
                   "detail": (pcp_line or "no pcp lines in debug.log") + (" · router answers NAT-PMP" if _natpmp_probe(gw) else " · router silent on 5351"),
                   "action": "nothing to do if the router stays silent", "can_act": False})
-    paths.append({"key": "upnp", "name": "UPnP (IGD)", "state": "unsupported" if not _upnp_probe() else "router-has-igd",
-                  "detail": "Core ≥ v29 has no UPnP client; router " + ("answers SSDP" if _upnp_probe() else "does not answer SSDP"),
+    igd = _upnp_probe()
+    paths.append({"key": "upnp", "name": "UPnP (IGD)", "state": "unsupported" if not igd else "router-has-igd",
+                  "detail": "Core ≥ v29 has no UPnP client; router " + ("answers SSDP" if igd else "does not answer SSDP"),
                   "action": "—", "can_act": False})
     tor_state_s = ("working" if tor["onion_addr"] and tor["onion_reachable"] else
                    "configured" if tor["conf_listenonion"] and tor["conf_torcontrol"] else
@@ -323,3 +324,153 @@ def manual_peers():
     r = rpc("getaddednodeinfo") or []
     return [{"addr": n.get("addednode"), "connected": n.get("connected"),
              "via": ", ".join(f"{a.get('address')} ({a.get('connected')})" for a in n.get("addresses", []))} for n in r]
+
+
+# ───────────────────────── CONSUMER MODE: a node that takes but does not serve ─────────────────────────
+def conf_set(key, value):
+    """Set key=value in bitcoin.conf (replace the first uncommented line, else append). Backup, 0600."""
+    try:
+        lines = open(CONF).read().splitlines()
+    except OSError:
+        lines = []
+    shutil.copy2(CONF, CONF + ".bak-" + time.strftime("%Y%m%d%H%M%S")) if os.path.exists(CONF) else None
+    done = False; out = []
+    for ln in lines:
+        if not done and re.match(rf"^\s*{re.escape(key)}\s*=", ln):
+            out.append(f"{key}={value}"); done = True
+        else:
+            out.append(ln)
+    if not done:
+        out.append(f"{key}={value}")
+    with open(CONF, "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    os.chmod(CONF, 0o600)
+    return True
+
+
+def consumer_state():
+    """{on, conf_listen, ufw_deny, inbound, applied}. ON = the node does not accept inbound
+    (bitcoin.conf listen=0 → fully applied after a Core restart; the firewall deny applies now)."""
+    cs = conf(); ni = rpc("getnetworkinfo")
+    inb = ni.get("connections_in") if ni else None
+    deny = None
+    for path in ("/etc/ufw/user.rules", "/etc/ufw/user6.rules"):
+        try:
+            txt = open(path).read()
+            if re.search(r"--dport 8333 .*-j (DROP|REJECT)", txt): deny = True
+            elif deny is None and re.search(r"--dport 8333 .*-j ACCEPT", txt): deny = False
+        except OSError:
+            pass
+    on = cs.get("listen") == "0"
+    return {"on": on, "conf_listen": cs.get("listen", "1"), "ufw_deny": deny, "inbound": inb,
+            "applied": on and (inb == 0) and (deny is not False)}
+
+
+def set_consumer_mode(on):
+    """ON: listen=0 in bitcoin.conf (Core stops listening after restart) + ufw deny 8333/tcp now +
+    disconnect current inbound peers now. OFF: listen=1 + ufw allow 8333/tcp. One pkexec. Outbound
+    (the chain) is untouched either way. Returns (ok, message)."""
+    conf_set("listen", "0" if on else "1")
+    if on:
+        fw = "ufw --force delete allow 8333/tcp >/dev/null 2>&1; ufw deny 8333/tcp comment 'consumer mode (BANKON ICE)' && echo fw-ok"
+    else:
+        fw = "ufw --force delete deny 8333/tcp >/dev/null 2>&1; ufw allow 8333/tcp comment 'bitcoin p2p (BANKON)' && echo fw-ok"
+    r = _run(["pkexec", "sh", "-c", fw], timeout=60)
+    fw_ok = bool(r and "fw-ok" in (r.stdout or ""))
+    dropped = 0
+    if on:
+        for p in rpc("getpeerinfo") or []:
+            if p.get("inbound"):
+                rpc("disconnectnode", ["", int(p["id"])]); dropped += 1
+    msg = (f"consumer mode {'ON' if on else 'OFF'}: bitcoin.conf listen={'0' if on else '1'} · firewall {'deny' if on else 'allow'} 8333 {'✓' if fw_ok else '✗ (pkexec declined?)'}"
+           + (f" · {dropped} inbound peer(s) disconnected" if on else "")
+           + f" · Core {'stops' if on else 'resumes'} listening after a restart (🔁 restart Core)")
+    return fw_ok, msg
+
+
+# ───────────────────────── TOR: on/off + diagnostics from Tor's own control port ─────────────────────────
+def tor_set(on):
+    """Start/enable or stop/disable the tor unit (pkexec). Stopping kills outbound onion peers too."""
+    cmd = "systemctl enable --now tor && systemctl is-active tor" if on else "systemctl disable --now tor; systemctl is-active tor || echo stopped"
+    r = _run(["pkexec", "sh", "-c", cmd], timeout=60)
+    out = ((r.stdout or "") + (r.stderr or "")).strip() if r else "pkexec timed out"
+    ok = bool(r and r.returncode == 0) if on else bool(r and ("stopped" in out or "inactive" in out))
+    return ok, f"tor {'started' if on else 'stopped'}: {out[-120:]}"
+
+
+def _tor_control(queries, timeout=4):
+    """Authenticate on the control port with bitcoin.conf's torpassword and run GETINFO queries.
+    Returns {query: value} (multi-line values joined); None if the port or password is unavailable."""
+    pw = conf().get("torpassword")
+    if not pw:
+        return None
+    try:
+        s = socket.create_connection(("127.0.0.1", 9051), timeout=timeout); f = s.makefile("rwb", buffering=0)
+        def send(line):
+            f.write((line + "\r\n").encode()); out = []; data = False
+            while True:
+                ln = f.readline().decode(errors="ignore").rstrip("\r\n")
+                if ln == "" and not data: break
+                out.append(ln)
+                if data:                                   # inside a 250+ multi-line value: raw until a lone '.'
+                    if ln == ".": data = False
+                    continue
+                if ln.startswith("250+"): data = True; continue
+                if ln[:3].isdigit() and ln[3:4] == " ": break   # final status line (250 OK / 5xx)
+            return out
+        auth = send(f'AUTHENTICATE "{pw}"')
+        if not auth or not auth[-1].startswith("250"):
+            s.close(); return None
+        res = {}
+        for q in queries:
+            lines = send(f"GETINFO {q}")
+            vals = []
+            for ln in lines:
+                if ln.startswith("250-" + q + "="): vals.append(ln[len(q) + 5:])
+                elif ln.startswith("250+" + q + "="): continue
+                elif ln.startswith("250 OK") or ln == ".": continue
+                elif ln.startswith("250 " + q + "="): vals.append(ln[len(q) + 5:])
+                elif not ln.startswith(("250", "5")): vals.append(ln)
+            res[q] = "\n".join(vals).strip()
+        send("QUIT"); s.close(); return res
+    except Exception:
+        return None
+
+
+def tor_diagnostics():
+    """[(check, ok|None, detail)] — service · bootstrap · liveness · circuits · traffic · onion · peers."""
+    rows = []
+    installed = _has("tor"); svc = _unit("tor")
+    rows.append(("tor service", svc == "active", f"{'installed' if installed else 'not installed'} · {svc or '—'}"))
+    socks, ctrl = _port_open("127.0.0.1", 9050), _port_open("127.0.0.1", 9051)
+    rows.append(("ports", socks and ctrl, f"SOCKS :9050 {'open' if socks else 'closed'} · control :9051 {'open' if ctrl else 'closed'}"))
+    info = _tor_control(["version", "status/bootstrap-phase", "network-liveness", "traffic/read", "traffic/written",
+                         "circuit-status", "orconn-status", "status/circuit-established"]) if ctrl else None
+    if info is None:
+        rows.append(("control auth", None if not ctrl else False, "no torpassword in bitcoin.conf or auth refused" if ctrl else "control port closed"))
+    else:
+        m = re.search(r"PROGRESS=(\d+)", info.get("status/bootstrap-phase", "")); prog = int(m.group(1)) if m else None
+        rows.append(("bootstrap", prog == 100 if prog is not None else None, info.get("status/bootstrap-phase", "")[:120]))
+        rows.append(("liveness", info.get("network-liveness") == "up", f"network-liveness {info.get('network-liveness') or '—'} · circuit-established {info.get('status/circuit-established') or '—'}"))
+        circ = [ln for ln in info.get("circuit-status", "").splitlines() if ln.strip()]
+        built = sum(1 for ln in circ if " BUILT " in (" " + ln + " "))
+        rows.append(("circuits", built > 0, f"{built} built / {len(circ)} total · {len([l for l in info.get('orconn-status', '').splitlines() if l.strip()])} OR connections"))
+        try:
+            rd, wr = int(info.get("traffic/read") or 0), int(info.get("traffic/written") or 0)
+        except ValueError:
+            rd = wr = 0
+        rows.append(("traffic", None, f"read {rd:,} B · written {wr:,} B (since tor started)"))
+        rows.append(("version", True, info.get("version") or "—"))
+    st = tor_state()
+    rows.append(("onion service", bool(st["onion_addr"]) and bool(st["onion_reachable"]),
+                 f"{st['onion_addr'] or 'no address yet'} · Core reachable:onion {st['onion_reachable']}"
+                 + ("" if st["conf_listenonion"] else " · listenonion not set")))
+    peers = rpc("getpeerinfo") or []
+    oin = sum(1 for p in peers if p.get("network") == "onion" and p.get("inbound")); oout = sum(1 for p in peers if p.get("network") == "onion" and not p.get("inbound"))
+    rows.append(("onion peers", (oin + oout) > 0, f"{oin} in · {oout} out (of {len(peers)} peers)"))
+    cs = conf()
+    rows.append(("bitcoin.conf", bool(cs.get("torcontrol")), f"listenonion={cs.get('listenonion') or '—'} · torcontrol={cs.get('torcontrol') or '—'} · onion={cs.get('onion') or '—'} · proxy={cs.get('proxy') or '— (clearnet stays direct)'}"))
+    r = _run(["journalctl", "-u", "tor", "-n", "3", "--no-pager", "-o", "cat"], timeout=5)
+    if r and r.stdout.strip():
+        rows.append(("tor log", None, " ⏎ ".join(ln.strip()[:90] for ln in r.stdout.strip().splitlines()[-3:])))
+    return rows

@@ -18,14 +18,16 @@ def _R():
 
 
 def probe():
-    return _R().probe()
+    st = _R().probe(); st["consumer"] = _R().consumer_state(); return st
 
 
 def render(st):
     inb = st.get("inbound"); paths = {p["key"]: p for p in st.get("paths", [])}
     tor = paths.get("tor-onion", {}); v4 = paths.get("ipv4-forward", {}); ufw = paths.get("ufw", {})
     onion = st.get("tor", {}).get("onion_addr")
-    return (f"inbound {inb if inb is not None else '—'} / outbound {st.get('outbound') if st.get('outbound') is not None else '—'} · "
+    cm = st.get("consumer") or {}
+    mode = "🔇 CONSUMER (not serving)" if cm.get("on") else "serving"
+    return (f"{mode} · inbound {inb if inb is not None else '—'} / outbound {st.get('outbound') if st.get('outbound') is not None else '—'} · "
             f"IPv4 forward {v4.get('state', '?')} · Tor onion {tor.get('state', '?')}{(' ' + onion) if onion else ''} · ufw {ufw.get('state', '?')} · "
             f"nets " + " ".join(f"{k}{'✓' if v else '✗'}" for k, v in (st.get('networks') or {}).items()))
 
@@ -42,7 +44,15 @@ def _selftest():
     ok, msg = _R().onion_selftest(); return msg
 
 
+def _consumer_on():  return _R().set_consumer_mode(True)[1]
+def _consumer_off(): return _R().set_consumer_mode(False)[1]
+def _tor_diag():     return " · ".join(f"{k} {'✓' if ok else '✗' if ok is False else '·'} {d[:40]}" for k, ok, d in _R().tor_diagnostics())
+
+
 ACTIONS = [
+    ("🔇 consumer ON", _consumer_on, "listen=0 · ufw deny 8333 · disconnect inbound — take, don't serve", True),
+    ("📡 consumer OFF", _consumer_off, "listen=1 · ufw allow 8333", True),
+    ("🧅 tor diagnostics", _tor_diag, "bootstrap · liveness · circuits · onion · peers from Tor's control port", False),
     ("🧪 onion self-test", _selftest, "dial our own .onion through Tor's SOCKS — the inbound test that needs no outside help", False),
     ("🛡 ufw allow 8333", lambda: _R().allow_ufw()[1], "ufw allow 8333/tcp", True),
 ]
