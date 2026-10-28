@@ -13,6 +13,7 @@ single-task action where the host can act by itself:
   tunnel         a rented public endpoint (VPS / VPN port) — documented, never automated
 
 Truth sources: bitcoin.conf, getnetworkinfo (localaddresses, networks[].reachable, connections_in),
+getpeerinfo (inbound per network, addrlocal = our public address as peers see it),
 systemd (tor, i2pd), /etc/tor/torrc, ufw, debug.log (pcp lines), the socket layer.
 Mutations escalate with pkexec and are evidence (.history kind ice-reach). ICE has precedence.
 """
@@ -188,6 +189,120 @@ def onion_selftest(timeout=25):
         return False, f"self-test failed: {e}"
 
 
+def inbound_by_net():
+    """Inbound peers per network from getpeerinfo — the only way to say WHICH path a peer came in by.
+    None when Core is unreachable (never a fabricated 0)."""
+    peers = rpc("getpeerinfo")
+    if peers is None:
+        return None
+    out = {}
+    for p in peers:
+        if p.get("inbound"):
+            out[p.get("network", "?")] = out.get(p.get("network", "?"), 0) + 1
+    return out
+
+
+def public_addrs():
+    """Our address as the network sees it — `addrlocal` reported by outbound peers (local-first: no
+    'what is my IP' service). {'ipv4': (addr, agreeing peers) | None, 'ipv6': ...}."""
+    peers = rpc("getpeerinfo") or []
+    votes = {"ipv4": {}, "ipv6": {}}
+    for p in peers:
+        if p.get("inbound") or not p.get("addrlocal"):
+            continue
+        a = p["addrlocal"].rsplit(":", 1)[0]
+        fam = "ipv6" if a.startswith("[") else "ipv4"
+        a = a.strip("[]")
+        if ":" in a and fam == "ipv4":
+            continue
+        votes[fam][a] = votes[fam].get(a, 0) + 1
+    return {fam: (max(v, key=v.get), v[max(v, key=v.get)]) if v else None for fam, v in votes.items()}
+
+
+def _socks_connect(atyp, addr_bytes, port, timeout):
+    """SOCKS5 CONNECT through tor (127.0.0.1:9050). Returns the reply code (0 = connected) or None."""
+    s = socket.create_connection(("127.0.0.1", 9050), timeout=5)
+    try:
+        s.sendall(b"\x05\x01\x00")
+        if s.recv(2) != b"\x05\x00":
+            return None
+        s.settimeout(timeout)
+        s.sendall(b"\x05\x01\x00" + bytes([atyp]) + addr_bytes + int(port).to_bytes(2, "big"))
+        rep = s.recv(10)
+        return rep[1] if len(rep) >= 2 else None
+    finally:
+        s.close()
+
+
+_SOCKS_REP = {1: "general failure", 2: "not allowed by ruleset", 3: "network unreachable", 4: "host unreachable",
+              5: "connection refused", 6: "TTL expired (timed out)", 7: "command not supported", 8: "address type not supported"}
+
+
+def _control_dial(family, timeout=20):
+    """Control for the self-test: dial one of OUR OWN outbound peers (same family) through the same Tor
+    exit path. If that works and our address does not, the difference is the router. (peer, seconds | None)."""
+    peers = rpc("getpeerinfo") or []
+    af = socket.AF_INET if family == "ipv4" else socket.AF_INET6
+    cands = []
+    for p in peers:
+        if p.get("inbound") or p.get("network") != family or p.get("connection_type") in ("addr-fetch", "feeler", "private-broadcast"):
+            continue
+        m = re.match(r"^\[?([0-9a-fA-F.:]+)\]?:(\d+)$", p.get("addr", ""))
+        if not m:
+            continue  # DNS-seed names and the like are not dialable by IP
+        try:
+            socket.inet_pton(af, m.group(1)); cands.append((p["addr"], m.group(1), int(m.group(2))))
+        except OSError:
+            pass
+    if not cands:
+        return None, None
+    addr, host, port = cands[0]
+    try:
+        t0 = time.monotonic()
+        rep = _socks_connect(0x01 if family == "ipv4" else 0x04, socket.inet_pton(af, host), port, timeout)
+        return addr, (time.monotonic() - t0) if rep == 0 else None
+    except Exception:
+        return addr, None
+
+
+def clearnet_selftest(family="ipv4", timeout=25):
+    """Dial our OWN public address :8333 from OUTSIDE — through a Tor exit, so no third-party service
+    sees anything but a TCP connect to a Bitcoin port. A SOCKS success means the router forward (IPv4)
+    or pinhole (IPv6) delivered the connection to Core's listener; Core logs it as an inbound
+    connection from the exit's IP that closes at once. A control dial to one of our outbound peers
+    through the same path makes a failure conclusive. Returns (ok | None, detail)."""
+    pa = public_addrs().get(family)
+    if not pa:
+        return None, f"no {family} address reported by outbound peers (addrlocal) — nothing to dial"
+    addr, n = pa
+    if not _port_open("127.0.0.1", 9050):
+        return None, "tor SOCKS (127.0.0.1:9050) closed — enable Tor on the 🧅 page first"
+    seen = f"{addr}:{PORT} (as {n} peer{'s' if n != 1 else ''} see us)"
+    t0 = time.monotonic(); timed_out = False
+    try:
+        rep = _socks_connect(0x01 if family == "ipv4" else 0x04,
+                             socket.inet_pton(socket.AF_INET if family == "ipv4" else socket.AF_INET6, addr), PORT, timeout)
+    except socket.timeout:
+        rep, timed_out = None, True
+    except Exception as e:
+        return None, f"self-test failed: {e}"
+    dt = time.monotonic() - t0
+    if rep == 0:
+        return True, f"a Tor exit connected to {seen} in {dt:.1f} s — inbound {family} path works (Core logs a short inbound from the exit)"
+    if rep is None and not timed_out:
+        return None, "SOCKS5 handshake refused by tor"
+    # failed — run the control so the verdict is about the router, not about Tor
+    cpeer, csec = _control_dial(family)
+    ctrl = (f"control: exit reached our peer {cpeer} in {csec:.1f} s" if csec is not None else
+            f"control: exit could not reach our peer {cpeer}" if cpeer else f"control: no outbound {family} peer to dial")
+    why = "timed out after %.0f s (silently dropped)" % dt if timed_out else _SOCKS_REP.get(rep, f"reply {rep}")
+    if csec is None:
+        return None, f"inconclusive — {seen}: {why}; {ctrl} (this exit cannot do {family}; retry picks another exit)"
+    hint = {"ipv4": "the gateway does not forward TCP 8333 → this host (or ufw/listen off)",
+            "ipv6": "the router's IPv6 firewall has no pinhole for TCP 8333 (or ufw/listen off)"}[family]
+    return False, f"{seen} NOT reachable from outside: {why} — {hint}; {ctrl}"
+
+
 def probe():
     cs = conf(); ni = rpc("getnetworkinfo"); gw = _gateway()
     inb = ni.get("connections_in") if ni else None
@@ -196,15 +311,20 @@ def probe():
     pcp, pcp_line = _pcp_log()
     tor = tor_state()
     paths = []
-    # ipv4 forward: the host can only observe (inbound count on a v4 address) — the router holds the truth
-    v4_in = inb is not None and inb > 0
+    # ipv4 forward: the host can only observe — and only an inbound peer ON ipv4 proves it (an onion inbound does not)
+    bynet = inbound_by_net() or {}
+    pub = public_addrs()
+    v4_in = bynet.get("ipv4", 0); v6_in = bynet.get("ipv6", 0)
+    seen4 = f"seen from outside as {pub['ipv4'][0]} ({pub['ipv4'][1]} peers agree)" if pub.get("ipv4") else "public IPv4 unknown (no addrlocal from peers)"
     paths.append({"key": "ipv4-forward", "name": "IPv4 router forward → :8333", "state": "working" if v4_in else "unknown",
-                  "detail": f"gateway {gw or '—'} · host listens :8333 · inbound now {inb if inb is not None else '—'}",
-                  "action": "router UI: forward TCP 8333 → this host", "can_act": False})
+                  "detail": f"gateway {gw or '—'} · {seen4} · inbound ipv4 now {v4_in if inb is not None else '—'}"
+                            + (f" · other inbound: {', '.join(f'{k} {v}' for k, v in bynet.items() if k != 'ipv4')}" if any(k != 'ipv4' for k in bynet) else ""),
+                  "action": "router UI: forward TCP 8333 → this host · ⇄ clearnet self-test proves it", "can_act": False})
     v6 = _ipv6_global()
-    paths.append({"key": "ipv6-pinhole", "name": "IPv6 firewall pinhole → :8333", "state": "candidate" if v6 else "no-ipv6",
-                  "detail": (f"global {v6[0]}" if v6 else "no global IPv6") + (" · advertised" if any(':' in a and '.onion' not in a for a in local) else ""),
-                  "action": "router UI: allow inbound TCP 8333 to this host's IPv6", "can_act": False})
+    paths.append({"key": "ipv6-pinhole", "name": "IPv6 firewall pinhole → :8333", "state": "working" if v6_in else ("candidate" if v6 else "no-ipv6"),
+                  "detail": (f"global {v6[0]}" if v6 else "no global IPv6") + (" · advertised" if any(':' in a and '.onion' not in a for a in local) else "")
+                            + (f" · inbound ipv6 now {v6_in}" if inb is not None else ""),
+                  "action": "router UI: allow inbound TCP 8333 to this host's IPv6 · ⇄ clearnet self-test proves it", "can_act": False})
     paths.append({"key": "pcp", "name": "PCP / NAT-PMP (Core -natpmp)", "state": {"mapped": "working", "timeout": "unsupported", "bind-error": "error"}.get(pcp, "unknown"),
                   "detail": (pcp_line or "no pcp lines in debug.log") + (" · router answers NAT-PMP" if _natpmp_probe(gw) else " · router silent on 5351"),
                   "action": "nothing to do if the router stays silent", "can_act": False})
@@ -230,7 +350,8 @@ def probe():
     paths.append({"key": "tunnel", "name": "Rented public endpoint (VPS/VPN port)", "state": "manual",
                   "detail": "WireGuard/SSH reverse tunnel to :8333 — a third party in the path; all inbound from one netgroup",
                   "action": "documented only — see docs/ICE.md reachability", "can_act": False})
-    return {"inbound": inb, "outbound": outb, "local": local, "listen": cs.get("listen", "1") != "0",
+    return {"inbound": inb, "outbound": outb, "inbound_by_net": bynet if inb is not None else None, "public": pub,
+            "local": local, "listen": cs.get("listen", "1") != "0",
             "networks": {n["name"]: n.get("reachable") for n in (ni or {}).get("networks", [])}, "paths": paths, "tor": tor}
 
 
