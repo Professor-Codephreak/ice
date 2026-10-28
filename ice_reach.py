@@ -10,7 +10,9 @@ single-task action where the host can act by itself:
   tor-onion      Core creates its own hidden service (listenonion + torcontrol) — no router needed
   i2p            i2psam — an I2P router on the host
   ufw            the host firewall must allow 8333/tcp (the second wall)
-  tunnel         a rented public endpoint (VPS / VPN port) — documented, never automated
+  tunnel         a rented public endpoint: reverse SSH tunnel kept by a systemd user unit (no router needed)
+  service-onion  the WaaS API (and optionally the Console) as a Tor hidden service — clients reach the
+                 SERVICE without any router change
 
 Truth sources: bitcoin.conf, getnetworkinfo (localaddresses, networks[].reachable, connections_in),
 getpeerinfo (inbound per network, addrlocal = our public address as peers see it),
@@ -265,42 +267,280 @@ def _control_dial(family, timeout=20):
         return addr, None
 
 
-def clearnet_selftest(family="ipv4", timeout=25):
-    """Dial our OWN public address :8333 from OUTSIDE — through a Tor exit, so no third-party service
-    sees anything but a TCP connect to a Bitcoin port. A SOCKS success means the router forward (IPv4)
-    or pinhole (IPv6) delivered the connection to Core's listener; Core logs it as an inbound
-    connection from the exit's IP that closes at once. A control dial to one of our outbound peers
-    through the same path makes a failure conclusive. Returns (ok | None, detail)."""
-    pa = public_addrs().get(family)
-    if not pa:
-        return None, f"no {family} address reported by outbound peers (addrlocal) — nothing to dial"
-    addr, n = pa
+def _outside_dial(family, addr, port, seen, hint, timeout=25):
+    """Dial addr:port from OUTSIDE through a Tor exit; a control dial to one of our own outbound peers
+    through the same path decides whether a failure is about the target or about the exit."""
     if not _port_open("127.0.0.1", 9050):
         return None, "tor SOCKS (127.0.0.1:9050) closed — enable Tor on the 🧅 page first"
-    seen = f"{addr}:{PORT} (as {n} peer{'s' if n != 1 else ''} see us)"
+    af = socket.AF_INET if family == "ipv4" else socket.AF_INET6
     t0 = time.monotonic(); timed_out = False
     try:
-        rep = _socks_connect(0x01 if family == "ipv4" else 0x04,
-                             socket.inet_pton(socket.AF_INET if family == "ipv4" else socket.AF_INET6, addr), PORT, timeout)
+        rep = _socks_connect(0x01 if family == "ipv4" else 0x04, socket.inet_pton(af, addr), port, timeout)
     except socket.timeout:
         rep, timed_out = None, True
     except Exception as e:
         return None, f"self-test failed: {e}"
     dt = time.monotonic() - t0
     if rep == 0:
-        return True, f"a Tor exit connected to {seen} in {dt:.1f} s — inbound {family} path works (Core logs a short inbound from the exit)"
+        return True, f"a Tor exit connected to {seen} in {dt:.1f} s — reachable from outside (Core logs a short inbound from the exit)"
     if rep is None and not timed_out:
         return None, "SOCKS5 handshake refused by tor"
-    # failed — run the control so the verdict is about the router, not about Tor
     cpeer, csec = _control_dial(family)
     ctrl = (f"control: exit reached our peer {cpeer} in {csec:.1f} s" if csec is not None else
             f"control: exit could not reach our peer {cpeer}" if cpeer else f"control: no outbound {family} peer to dial")
     why = "timed out after %.0f s (silently dropped)" % dt if timed_out else _SOCKS_REP.get(rep, f"reply {rep}")
     if csec is None:
         return None, f"inconclusive — {seen}: {why}; {ctrl} (this exit cannot do {family}; retry picks another exit)"
+    return False, f"{seen} NOT reachable from outside: {why} — {hint}; {ctrl}"
+
+
+def clearnet_selftest(family="ipv4", timeout=25):
+    """Dial our OWN public address :8333 from OUTSIDE — through a Tor exit, so no third-party service
+    sees anything but a TCP connect to a Bitcoin port. Success means the router forward (IPv4) or
+    pinhole (IPv6) delivered the connection to Core's listener. Returns (ok | None, detail)."""
+    pa = public_addrs().get(family)
+    if not pa:
+        return None, f"no {family} address reported by outbound peers (addrlocal) — nothing to dial"
+    addr, n = pa
+    seen = f"{addr}:{PORT} (as {n} peer{'s' if n != 1 else ''} see us)"
     hint = {"ipv4": "the gateway does not forward TCP 8333 → this host (or ufw/listen off)",
             "ipv6": "the router's IPv6 firewall has no pinhole for TCP 8333 (or ufw/listen off)"}[family]
-    return False, f"{seen} NOT reachable from outside: {why} — {hint}; {ctrl}"
+    return _outside_dial(family, addr, PORT, seen, hint, timeout)
+
+
+# ───────────── no-router paths: reverse SSH tunnel to a rented endpoint · service onion ─────────────
+UNIT_DIR = os.path.join(os.path.expanduser("~"), ".config", "systemd", "user")
+TUNNEL_UNIT = "bankon-ice-tunnel.service"
+TUNNEL_CFG = os.path.expanduser("~/.bankon/ice-tunnel.json")
+SERVICE_ONION = os.path.expanduser("~/.bankon/ice-service-onion.json")
+SERVICE_PORTS = {"waas": 8088, "console": 8090}          # what BANKON serves on loopback
+TOR_SVC_DIR = "/var/lib/tor/bankon-service"
+_SVC_BEGIN, _SVC_END = "# BANKON ICE: service onion BEGIN", "# BANKON ICE: service onion END"
+
+
+def _json_read(path):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return {}
+
+
+def _json_write(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(obj, fh, indent=1)
+    os.chmod(path, 0o600)
+
+
+def conf_unset(key):
+    """Comment out every uncommented key= line in bitcoin.conf (backup, 0600). Returns how many."""
+    try:
+        lines = open(CONF).read().splitlines()
+    except OSError:
+        return 0
+    n = 0; out = []
+    for ln in lines:
+        if re.match(rf"^\s*{re.escape(key)}\s*=", ln):
+            out.append("#" + ln); n += 1
+        else:
+            out.append(ln)
+    if n:
+        shutil.copy2(CONF, CONF + ".bak-" + time.strftime("%Y%m%d%H%M%S"))
+        with open(CONF, "w") as fh:
+            fh.write("\n".join(out) + "\n")
+        os.chmod(CONF, 0o600)
+    return n
+
+
+def _resolve4(host):
+    try:
+        return socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+    except Exception:
+        return None
+
+
+def tunnel_state():
+    """The reverse tunnel as it IS: config, unit state, Core's externalip, inbound peers that arrived
+    through loopback but not via the onion listener, the unit's last log lines."""
+    cfg = _json_read(TUNNEL_CFG)
+    st = {"configured": bool(cfg.get("endpoint")), "endpoint": cfg.get("endpoint"), "remote_port": cfg.get("remote_port"),
+          "endpoint_ip": cfg.get("endpoint_ip"), "unit": _unit_user(TUNNEL_UNIT), "externalip": conf().get("externalip"),
+          "inbound_via": None, "log": None, "ssh": _has("ssh")}
+    peers = rpc("getpeerinfo")
+    if peers is not None:
+        st["inbound_via"] = sum(1 for p in peers if p.get("inbound") and str(p.get("addr", "")).startswith("127.0.0.1:") and p.get("network") != "onion")
+    r = _run(["journalctl", "--user", "-u", TUNNEL_UNIT, "-n", "3", "--no-pager", "-o", "cat"], timeout=5)
+    if r and r.stdout.strip():
+        st["log"] = " ⏎ ".join(ln.strip()[:100] for ln in r.stdout.strip().splitlines()[-3:])
+    return st
+
+
+def tunnel_setup(endpoint, remote_port=8333, ssh_port=22, identity=None, advertise=True):
+    """Reverse SSH tunnel kept alive by a systemd USER unit (systemd is the retry: Restart=always).
+    Needs: an account on the endpoint with KEY auth (BatchMode — no password prompts in a unit) and
+    `GatewayPorts yes|clientspecified` in the endpoint's sshd_config so the port binds on 0.0.0.0.
+    advertise=True writes externalip=<endpoint ip>:<port> so Core tells the network (Core restart)."""
+    endpoint = (endpoint or "").strip()
+    if not re.match(r"^[\w.\-]+@[\w.\-\[\]:]+$", endpoint):
+        return False, "endpoint must be user@host"
+    if not _has("ssh"):
+        return False, "ssh not installed (apt-get install openssh-client)"
+    host = endpoint.split("@", 1)[1]
+    ip = _resolve4(host.strip("[]"))
+    if not ip:
+        return False, f"cannot resolve {host}"
+    remote_port = int(remote_port); ssh_port = int(ssh_port)
+    identity = os.path.expanduser(identity.strip()) if identity and identity.strip() else None
+    if identity and not os.path.exists(identity):
+        return False, f"identity file not found: {identity}"
+    cmd = ["/usr/bin/ssh", "-NT", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+           "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-p", str(ssh_port)]
+    if identity:
+        cmd += ["-i", identity]
+    cmd += ["-R", f"0.0.0.0:{remote_port}:127.0.0.1:{PORT}", endpoint]
+    os.makedirs(UNIT_DIR, exist_ok=True)
+    unit = f"""[Unit]
+Description=BANKON ICE tunnel — reverse SSH :{remote_port} on {host} → this node :{PORT} (docs/ICE.md)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={' '.join(cmd)}
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=default.target
+"""
+    with open(os.path.join(UNIT_DIR, TUNNEL_UNIT), "w") as fh:
+        fh.write(unit)
+    _json_write(TUNNEL_CFG, {"endpoint": endpoint, "endpoint_ip": ip, "remote_port": remote_port, "ssh_port": ssh_port,
+                             "identity": identity, "advertise": bool(advertise), "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    for c in (["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", TUNNEL_UNIT]):
+        r = _run(c, timeout=20)
+        if r is None or r.returncode != 0:
+            return False, (r.stderr.strip() if r else "systemctl --user unavailable")
+    msg = f"{TUNNEL_UNIT} enabled + started → {host}:{remote_port} (ip {ip})"
+    if advertise:
+        conf_set("externalip", f"{ip}:{remote_port}"); msg += f" · externalip={ip}:{remote_port} written (restart Core to advertise)"
+    time.sleep(3)
+    st = _unit_user(TUNNEL_UNIT)
+    if st != "active":
+        r = _run(["journalctl", "--user", "-u", TUNNEL_UNIT, "-n", "4", "--no-pager", "-o", "cat"], timeout=5)
+        return False, msg + f" · unit {st}: " + ((r.stdout.strip().replace(chr(10), ' ⏎ ')[-260:]) if r else "") + " — key auth (BatchMode) and GatewayPorts on the endpoint are required"
+    return True, msg + " · ssh session up — press 🧪 prove from outside"
+
+
+def tunnel_remove():
+    """Stop + disable the unit, delete it, comment out externalip. Returns (ok, msg)."""
+    _run(["systemctl", "--user", "disable", "--now", TUNNEL_UNIT], timeout=20)
+    try:
+        os.remove(os.path.join(UNIT_DIR, TUNNEL_UNIT))
+    except OSError:
+        pass
+    _run(["systemctl", "--user", "daemon-reload"], timeout=10)
+    n = conf_unset("externalip")
+    cfg = _json_read(TUNNEL_CFG)
+    try:
+        os.remove(TUNNEL_CFG)
+    except OSError:
+        pass
+    return True, f"tunnel removed ({cfg.get('endpoint') or '—'})" + (f" · externalip commented out ({n}) — restart Core to stop advertising" if n else "")
+
+
+def tunnel_selftest(timeout=25):
+    """Prove the tunnel from OUTSIDE: a Tor exit dials <endpoint ip>:<remote port>."""
+    cfg = _json_read(TUNNEL_CFG)
+    if not cfg.get("endpoint"):
+        return None, "no tunnel configured"
+    ip = cfg.get("endpoint_ip") or _resolve4(cfg["endpoint"].split("@", 1)[1].strip("[]"))
+    if not ip:
+        return None, "cannot resolve the endpoint"
+    port = int(cfg.get("remote_port") or PORT)
+    return _outside_dial("ipv4", ip, port, f"{ip}:{port} (the endpoint)",
+                         "the endpoint's sshd has no GatewayPorts yes/clientspecified (the -R port bound to its loopback), its firewall blocks the port, or the unit is down", timeout)
+
+
+def service_onion_state():
+    """The WaaS/Console onion as it IS: published address, which services, tor up, the local ports listening."""
+    cfg = _json_read(SERVICE_ONION)
+    ports = cfg.get("ports") or {}
+    return {"addr": cfg.get("addr"), "ports": ports, "when": cfg.get("when"), "tor": _unit("tor"),
+            "listening": {name: _port_open("127.0.0.1", int(port), 0.5) for name, port in ports.items()}}
+
+
+def waas_token_set():
+    """Is the WaaS API gated (BANKON_API_TOKEN in its user unit)? None when the unit is unknown."""
+    r = _run(["systemctl", "--user", "show", "bankon-waas.service", "-p", "Environment", "-p", "EnvironmentFiles"], timeout=4)
+    if not r or "Environment=" not in r.stdout:
+        return None
+    if "BANKON_API_TOKEN=" in r.stdout:
+        return True
+    for ln in r.stdout.splitlines():
+        if ln.startswith("EnvironmentFiles=") and ln.split("=", 1)[1].strip():
+            path = ln.split("=", 1)[1].split()[0].lstrip("-")
+            try:
+                if "BANKON_API_TOKEN=" in open(path).read():
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def service_onion_enable(services=("waas",), force=False):
+    """Publish BANKON's loopback services as ONE Tor hidden service (v3). One pkexec: torrc block,
+    tor reload, read the hostname tor generates. The address is stored 0600 in ~/.bankon.
+    Clients then reach the WaaS API at http://<addr>.onion:8088 with no router involved.
+    Refuses to publish an UNGATED WaaS API (no BANKON_API_TOKEN) unless force=True."""
+    chosen = {k: SERVICE_PORTS[k] for k in services if k in SERVICE_PORTS}
+    if not chosen:
+        return False, "no known service chosen (waas, console)"
+    if "waas" in chosen and not force and waas_token_set() is not True:
+        return False, "refused: the WaaS API has no BANKON_API_TOKEN (open to anyone who learns the address) — set it in the bankon-waas user unit, or publish with force"
+    lines = [f"HiddenServiceDir {TOR_SVC_DIR}/", "HiddenServiceVersion 3"] + [f"HiddenServicePort {p} 127.0.0.1:{p}" for p in chosen.values()]
+    block = "\n".join([_SVC_BEGIN] + lines + [_SVC_END])
+    script = (f"command -v tor >/dev/null || {{ echo no-tor; exit 3; }}; "
+              f"sed -i '/{_SVC_BEGIN}/,/{_SVC_END}/d' {TORRC}; printf '%s\n' '{block}' >> {TORRC}; "
+              f"systemctl enable tor >/dev/null 2>&1; systemctl reload tor || systemctl restart tor; "
+              f"for i in 1 2 3 4 5 6 7 8 9 10; do [ -s {TOR_SVC_DIR}/hostname ] && break; sleep 1; done; "
+              f"cat {TOR_SVC_DIR}/hostname")
+    r = _run(["pkexec", "sh", "-c", script], timeout=120)
+    out = ((r.stdout or "") + (r.stderr or "")).strip() if r else "pkexec timed out"
+    m = re.search(r"([a-z2-7]{56})\.onion", out)
+    if not (r and r.returncode == 0 and m):
+        return False, "service onion failed: " + ("tor not installed — enable Tor first" if "no-tor" in out else out[-260:])
+    addr = m.group(0)
+    _json_write(SERVICE_ONION, {"addr": addr, "ports": chosen, "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    return True, f"service onion published: {addr} → " + ", ".join(f"{k} :{p}" for k, p in chosen.items())
+
+
+def service_onion_remove():
+    script = f"sed -i '/{_SVC_BEGIN}/,/{_SVC_END}/d' {TORRC}; systemctl reload tor; rm -rf {TOR_SVC_DIR}; echo removed"
+    r = _run(["pkexec", "sh", "-c", script], timeout=60)
+    ok = bool(r and r.returncode == 0 and "removed" in (r.stdout or ""))
+    if ok:
+        try:
+            os.remove(SERVICE_ONION)
+        except OSError:
+            pass
+    return ok, "service onion removed (torrc block, keys, address)" if ok else "remove failed: " + ((r.stderr or r.stdout) if r else "pkexec timed out")[-200:]
+
+
+def service_onion_selftest(timeout=25):
+    """Dial the service onion through Tor's SOCKS, each published port."""
+    st = service_onion_state()
+    if not st["addr"]:
+        return None, "no service onion published"
+    res = []
+    for name, port in st["ports"].items():
+        try:
+            rep = _socks_connect(0x03, bytes([len(st["addr"])]) + st["addr"].encode(), int(port), timeout)
+            res.append((name, rep == 0, f"{name} :{port} " + ("✓ reached through Tor" if rep == 0 else f"✗ {_SOCKS_REP.get(rep, rep)}")))
+        except Exception as e:
+            res.append((name, None, f"{name} :{port} … {e}"))
+    ok = all(ok for _n, ok, _d in res)
+    return ok, f"{st['addr']}: " + " · ".join(d for _n, _ok, d in res)
 
 
 def probe():
@@ -339,17 +579,30 @@ def probe():
                   "detail": f"tor {tor['service'] or 'not installed'} · SOCKS {'open' if tor['socks'] else 'closed'} · control {'open' if tor['control'] else 'closed'} · "
                             f"onion {tor['onion_addr'] or '— (not yet)'}" + (" · reachable" if tor["onion_reachable"] else ""),
                   "action": "enable onion (installs tor, control port, bitcoin.conf, restarts Core)", "can_act": True})
-    i2p = {"installed": _has("i2pd") or _has("i2prouter"), "service": _unit("i2pd"), "conf": cs.get("i2psam")}
-    paths.append({"key": "i2p", "name": "I2P (i2psam)", "state": "configured" if i2p["conf"] else ("installed" if i2p["installed"] else "available"),
-                  "detail": f"i2pd {i2p['service'] or 'not installed'} · i2psam={i2p['conf'] or '—'}",
+    i2p = {"installed": _has("i2pd") or _has("i2prouter"), "service": _unit("i2pd"), "conf": cs.get("i2psam"), "sam": _port_open("127.0.0.1", 7656, 0.5)}
+    # Core flags i2p "reachable" as soon as -i2psam is SET — it is config, not a live SAM session. Truth = a .b32.i2p local address.
+    i2p_reach = next((n.get("reachable") for n in (ni or {}).get("networks", []) if n.get("name") == "i2p"), None)
+    i2p_addr = next((a for a in local if ".b32.i2p" in a), None)
+    i2p_state = ("working" if i2p_addr else "error" if (i2p["conf"] and (i2p["service"] in ("failed", "activating", "inactive") or not i2p["sam"])) else
+                 "configured" if i2p["conf"] else ("installed" if i2p["installed"] else "available"))
+    paths.append({"key": "i2p", "name": "I2P (i2psam)", "state": i2p_state,
+                  "detail": f"i2pd {i2p['service'] or 'not installed'} · SAM :7656 {'open' if i2p['sam'] else 'closed'} · i2psam={i2p['conf'] or '—'} · destination {i2p_addr or '— (none until SAM answers)'} · Core config reachable:i2p {i2p_reach if i2p_reach is not None else '—'}"
+                            + (" · i2pd crashing — see docs/I2P.md §6 (PPA)" if i2p["service"] in ("failed", "activating") else ""),
                   "action": "enable i2p (installs i2pd, SAM bridge, bitcoin.conf, restarts Core)", "can_act": True})
     ufw = _ufw_8333()
     paths.append({"key": "ufw", "name": "Host firewall (ufw) allows 8333/tcp", "state": "working" if ufw else ("unknown" if ufw is None else "blocked"),
                   "detail": "rule present (v4+v6)" if ufw else ("cannot read rules without root" if ufw is None else "no ALLOW rule for 8333"),
                   "action": "ufw allow 8333/tcp", "can_act": True})
-    paths.append({"key": "tunnel", "name": "Rented public endpoint (VPS/VPN port)", "state": "manual",
-                  "detail": "WireGuard/SSH reverse tunnel to :8333 — a third party in the path; all inbound from one netgroup",
-                  "action": "documented only — see docs/ICE.md reachability", "can_act": False})
+    tn = tunnel_state()
+    tn_state = ("working" if tn["unit"] == "active" else "error" if tn["unit"] in ("failed", "inactive", "activating") else "available")
+    paths.append({"key": "tunnel", "name": "Rented endpoint — reverse SSH tunnel (no router)", "state": tn_state,
+                  "detail": (f"{tn['endpoint']}:{tn['remote_port']} · unit {tn['unit']} · externalip={tn['externalip'] or '—'} · inbound via tunnel {tn['inbound_via'] if tn['inbound_via'] is not None else '—'}"
+                             if tn["configured"] else "not configured — any VPS/VPN host you hold an ssh key for; all inbound then shares one netgroup"),
+                  "action": "🚇 Tunnel page: endpoint · port · key → systemd user unit keeps it; 🧪 prove from outside", "can_act": True})
+    so = service_onion_state()
+    paths.append({"key": "service-onion", "name": "WaaS service onion (clients reach the API, no router)", "state": "working" if so["addr"] and so["tor"] == "active" else ("available" if tor["installed"] else "unsupported"),
+                  "detail": (f"{so['addr']} → " + ", ".join(f"{k} :{p}{'' if so['listening'].get(k) else ' (not listening!)'}" for k, p in so["ports"].items())) if so["addr"] else "not published — one pkexec publishes the WaaS API (and optionally the Console) as a v3 hidden service",
+                  "action": "🧅 Tor page: publish service onion · self-test", "can_act": True})
     return {"inbound": inb, "outbound": outb, "inbound_by_net": bynet if inb is not None else None, "public": pub,
             "local": local, "listen": cs.get("listen", "1") != "0",
             "networks": {n["name"]: n.get("reachable") for n in (ni or {}).get("networks", [])}, "paths": paths, "tor": tor}
@@ -426,6 +679,14 @@ def enable_i2p():
     ok = bool(r and r.returncode == 0 and "i2pd-ok" in out)
     if ok:
         ok2, msg2 = restart_core(); out += " · " + msg2; ok = ok and ok2
+    if ok:
+        time.sleep(6)
+        if _unit("i2pd") != "active" or not _port_open("127.0.0.1", 7656, 0.5):
+            j = _run(["journalctl", "-u", "i2pd", "-n", "6", "--no-pager", "-o", "cat"], timeout=5)
+            crash = "SEGV" in (j.stdout if j else "") or "core-dump" in (j.stdout if j else "")
+            return False, ("i2pd crashes at start (SIGSEGV) — the Ubuntu 2.39.0 package is broken here; install the project's PPA yourself: "
+                           "sudo add-apt-repository -y ppa:purplei2p/i2pd && sudo apt-get update && sudo apt-get install -y i2pd — see docs/I2P.md §6"
+                           if crash else f"i2pd {_unit('i2pd')} · SAM :7656 {'open' if _port_open('127.0.0.1', 7656, 0.5) else 'closed'} — Core will connect when SAM answers") + " · " + out[-160:]
     return ok, ("i2p enabled: " if ok else "i2p setup failed: ") + out[-300:] + (" · bitcoin.conf updated" if added else "")
 
 
@@ -589,6 +850,9 @@ def tor_diagnostics():
     peers = rpc("getpeerinfo") or []
     oin = sum(1 for p in peers if p.get("network") == "onion" and p.get("inbound")); oout = sum(1 for p in peers if p.get("network") == "onion" and not p.get("inbound"))
     rows.append(("onion peers", (oin + oout) > 0, f"{oin} in · {oout} out (of {len(peers)} peers)"))
+    so = service_onion_state()
+    rows.append(("service onion", (bool(so["addr"]) and all(so["listening"].values())) if so["addr"] else None,
+                 (f"{so['addr']} → " + " · ".join(f"{k} :{p} {'listening' if so['listening'].get(k) else 'NOT listening'}" for k, p in so["ports"].items())) if so["addr"] else "not published (WaaS API reachable only on this host)"))
     cs = conf()
     rows.append(("bitcoin.conf", bool(cs.get("torcontrol")), f"listenonion={cs.get('listenonion') or '—'} · torcontrol={cs.get('torcontrol') or '—'} · onion={cs.get('onion') or '—'} · proxy={cs.get('proxy') or '— (clearnet stays direct)'}"))
     r = _run(["journalctl", "-u", "tor", "-n", "3", "--no-pager", "-o", "cat"], timeout=5)

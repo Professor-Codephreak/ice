@@ -24,12 +24,12 @@ def probe():
 def render(st):
     inb = st.get("inbound"); paths = {p["key"]: p for p in st.get("paths", [])}
     bn = st.get("inbound_by_net"); by = (" (" + " ".join(f"{k} {v}" for k, v in bn.items()) + ")") if bn else ""
-    tor = paths.get("tor-onion", {}); v4 = paths.get("ipv4-forward", {}); ufw = paths.get("ufw", {})
+    tor = paths.get("tor-onion", {}); v4 = paths.get("ipv4-forward", {}); ufw = paths.get("ufw", {}); i2p = paths.get("i2p", {}); tn = paths.get("tunnel", {}); so = paths.get("service-onion", {})
     onion = st.get("tor", {}).get("onion_addr")
     cm = st.get("consumer") or {}
     mode = "🔇 CONSUMER (not serving)" if cm.get("on") else "serving"
     return (f"{mode} · inbound {inb if inb is not None else '—'}{by} / outbound {st.get('outbound') if st.get('outbound') is not None else '—'} · "
-            f"IPv4 forward {v4.get('state', '?')} · Tor onion {tor.get('state', '?')}{(' ' + onion) if onion else ''} · ufw {ufw.get('state', '?')} · "
+            f"IPv4 forward {v4.get('state', '?')} · Tor onion {tor.get('state', '?')}{(' ' + onion) if onion else ''} · I2P {i2p.get('state', '?')} · tunnel {tn.get('state', '?')} · service onion {so.get('state', '?')} · ufw {ufw.get('state', '?')} · "
             f"nets " + " ".join(f"{k}{'✓' if v else '✗'}" for k, v in (st.get('networks') or {}).items()))
 
 
