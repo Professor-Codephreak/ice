@@ -671,7 +671,10 @@ def _unit_user(name):
 def enable_i2p():
     """i2pd with the SAM bridge + bitcoin.conf i2psam + restart Core. One pkexec."""
     added = _conf_append(["i2psam=127.0.0.1:7656"], "# ── I2P (ICE reachability) ──") if not conf().get("i2psam") else False
-    script = ("export DEBIAN_FRONTEND=noninteractive; command -v i2pd >/dev/null || apt-get install -y -q i2pd >/tmp/ice-i2pd-install.log 2>&1; "
+    # Ubuntu/Mint's packaged i2pd 2.39.0 segfaults at start; on apt systems take the project's PPA (ppa:purplei2p/i2pd) first.
+    ppa = ("if command -v apt-get >/dev/null; then command -v add-apt-repository >/dev/null || apt-get install -y -q software-properties-common >>/tmp/ice-i2pd-install.log 2>&1; "
+           "grep -rqs purplei2p /etc/apt/sources.list.d/ || add-apt-repository -y ppa:purplei2p/i2pd >>/tmp/ice-i2pd-install.log 2>&1; apt-get update -q >>/tmp/ice-i2pd-install.log 2>&1; fi; ")
+    script = ("export DEBIAN_FRONTEND=noninteractive; " + ppa + "apt-get install -y -q i2pd >>/tmp/ice-i2pd-install.log 2>&1; "
               "grep -q '^\\[sam\\]' /etc/i2pd/i2pd.conf && sed -i '/^\\[sam\\]/,/^\\[/{s/^enabled *=.*/enabled = true/}' /etc/i2pd/i2pd.conf || printf '\\n[sam]\\nenabled = true\\naddress = 127.0.0.1\\nport = 7656\\n' >> /etc/i2pd/i2pd.conf; "
               "systemctl enable i2pd >/dev/null 2>&1; systemctl restart i2pd; sleep 2; systemctl is-active i2pd && echo i2pd-ok")
     r = _run(["pkexec", "sh", "-c", script], timeout=600)

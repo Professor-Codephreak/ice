@@ -138,11 +138,18 @@ eclipse. Core's outbound logic deliberately keeps at least one connection per re
 ## 6. Known problem on this host — i2pd 2.39.0 segfault
 
 Ubuntu jammy's `i2pd 2.39.0-1ubuntu1` crashes on start here (`SIGSEGV`, `journalctl -u i2pd`).
-The current release is in the project's PPA. Run this yourself (one time; it adds the PurpleI2P
-apt source, which ICE will not add on its own):
+The current release is in the project's PPA. Three ways to take that step, all idempotent:
+
+- **ICE**: 🔌 Connections → Reachability → **enable I2P** — `enable_i2p` now adds
+  `ppa:purplei2p/i2pd` on apt systems before installing i2pd (one pkexec prompt).
+- **bankonOS installer**: `ONLY=reach ./bankonos/install.sh` (tor + i2pd; PPA on Debian/Ubuntu).
+- **ICE installer**: `~/ICE/install.sh --reach`.
+- **By hand** (what the above run):
 
 ```
-! sudo add-apt-repository -y ppa:purplei2p/i2pd && sudo apt-get update && sudo apt-get install -y i2pd && sudo systemctl restart i2pd && sleep 5 && ss -ltn | grep 7656
+sudo add-apt-repository -y ppa:purplei2p/i2pd
+sudo apt-get update            # may exit non-zero because of OTHER stale repos — the PPA's lists are still fetched
+sudo apt-get install -y i2pd && sudo systemctl restart i2pd && sleep 5 && ss -ltn | grep 7656
 ```
 
 Then `bitcoin-cli getnetworkinfo` shows `i2p reachable: true` within a few minutes (Core reconnects
