@@ -118,6 +118,11 @@ debug=i2p
   `localaddresses` lists your `.b32.i2p`.
 - `bitcoin-cli getpeerinfo | grep -c '"network": "i2p"'` — I2P peers (out and in).
 - `ss -ltn | grep 7656` — SAM listening; `systemctl status i2pd`; `journalctl -u i2pd -n 30`.
+- i2pd's console at `http://127.0.0.1:7070` (the I2P row quotes it): **Network status: Firewalled** is
+  normal on a NAT host — i2pd still routes through introducers, only transit is reduced; **Tunnel
+  creation success rate** climbs over the first minutes; Core's destination appears once SAM can
+  build the session's lease set.
+- `bitcoin-cli logging '["i2p"]'` turns on Core's I2P log category at runtime (`debug=i2p` to persist).
 - The Net Map tags I2P peers; the Net Log's `network` column says `i2p`.
 
 ## 5. What it costs and what it buys
