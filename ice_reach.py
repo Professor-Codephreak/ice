@@ -359,6 +359,18 @@ def _resolve4(host):
         return None
 
 
+def sam_hello(timeout=4):
+    """Speak SAM to i2pd ourselves: HELLO → 'HELLO REPLY RESULT=OK VERSION=3.x'. (True, version) | (False, why) | (None, 'closed')."""
+    try:
+        with socket.create_connection(("127.0.0.1", 7656), timeout=timeout) as sk:
+            sk.sendall(b"HELLO VERSION MIN=3.0 MAX=3.1\n")
+            rep = sk.recv(256).decode("ascii", "replace").strip()
+    except OSError as e:
+        return None, f"SAM closed ({e})"
+    m = re.search(r"RESULT=(\w+)", rep); v = re.search(r"VERSION=([\d.]+)", rep)
+    return (m.group(1) == "OK" if m else False), (f"SAM {v.group(1)}" if v else rep[:60])
+
+
 def i2pd_console(timeout=3):
     """i2pd's own status from its loopback web console (:7070): network status, tunnel success rate,
     routers known, uptime. None when the console is off. Honest about 'Firewalled' (normal on NAT)."""
@@ -601,9 +613,10 @@ def probe():
     i2p_state = ("working" if i2p_addr else "error" if (i2p["conf"] and (i2p["service"] in ("failed", "activating", "inactive") or not i2p["sam"])) else
                  "configured" if i2p["conf"] else ("installed" if i2p["installed"] else "available"))
     con = i2pd_console() if i2p["service"] == "active" else None
+    hello = sam_hello() if i2p["sam"] else (None, "closed")
     con_s = (f" · router {con['status'] or '?'} (Firewalled is normal on NAT) · tunnels {con['tunnel_rate'] or '?'} · routers {con['routers'] or '?'} · up {con['uptime'] or '?'}" if con else "")
     paths.append({"key": "i2p", "name": "I2P (i2psam)", "state": i2p_state,
-                  "detail": f"i2pd {i2p['service'] or 'not installed'} · SAM :7656 {'open' if i2p['sam'] else 'closed'} · i2psam={i2p['conf'] or '—'} · destination {i2p_addr or '— (none until SAM answers)'}{con_s}"
+                  "detail": f"i2pd {i2p['service'] or 'not installed'} · SAM :7656 {('HELLO ok · ' + hello[1]) if hello[0] else ('open but ' + hello[1]) if i2p['sam'] else 'closed'} · i2psam={i2p['conf'] or '—'} · destination {i2p_addr or '— (none until SAM answers)'}{con_s}"
                             + (" · i2pd crashing — see docs/I2P.md §6 (PPA)" if i2p["service"] in ("failed", "activating") else ""),
                   "action": "enable i2p (installs i2pd, SAM bridge, bitcoin.conf, restarts Core)", "can_act": True})
     ufw = _ufw_8333()
