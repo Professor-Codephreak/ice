@@ -10,10 +10,12 @@ shows it on 🔌 Connections → 🌐 Reachability. I2P is slower than Tor (seco
 rebuilt every 10 minutes) and smaller (a few hundred Bitcoin nodes), so run it **alongside** Tor and
 clearnet, never alone, unless privacy is the only goal.
 
-Status on this host (2026-10-28): `i2psam` is in bitcoin.conf and Core was restarted with it; the
-Ubuntu-packaged **i2pd 2.39.0 segfaults at start** on this system, so SAM is not up yet. The fix is
-the project's own PPA (§6). Core simply reports `i2p reachable: false` until SAM answers — nothing
-else is affected.
+Status on this host: **live since 2026-10-29 03:57 UTC**. `i2psam` is in bitcoin.conf; the
+Ubuntu-packaged i2pd 2.39.0 segfaulted at start, i2pd 3.0.0 from the project's PPA (§6) fixed it;
+Core then created its persistent SAM session on its next retry and published
+`d67okszkqn66fkqpndxq34h2b7l67u2drfsdpn3n6pa6lviwr2fq.b32.i2p:0`. Core's accept thread retries a
+failed SAM session with a backoff that caps at 5 minutes, so a fixed i2pd is picked up without a
+Core restart.
 
 ---
 
